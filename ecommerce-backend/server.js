@@ -194,6 +194,6 @@ app.post('/api/payment', async (req, res) => {
 
 // Start the server
 app.listen(PORT, () => {
-  console.log(`Server is running on ${process.env.SERVER_URL}:${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
 
