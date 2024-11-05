@@ -1,0 +1,11 @@
+/* src/components/Cart.css */
+
+.cart {
+  margin: 0 auto; /* Center the cart div */
+  max-width: 600px; /* Set a max width for better alignment */
+  padding: 20px; /* Add some padding */
+}
+
+.cart-item {
+  margin: 10px 0; /* Add some margin between items */
+}
