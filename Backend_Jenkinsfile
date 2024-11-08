@@ -1,0 +1,234 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_IMAGE = 'backend'
+        SCANNER_HOME=tool 'sonar-scanner'
+        AWS_REGION = 'us-east-2'
+        ECR_REPO = 'backend'
+        AWS_ACCOUNT_ID = '842676005617'
+        ECR_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+    }
+
+    stages {
+        stage('Checkout Frontend Code') {  
+            steps {  
+                checkout([$class: 'GitSCM',   
+                    branches: [[name: '*/production']],   
+                    userRemoteConfigs: [[url: 'https://github.com/Madeep9347/ecommerce-three-tier.git', credentialsId: 'git-cred']]  
+                ])  
+            }  
+        } 
+        stage('Inject .env') {
+            steps {
+                script {
+                    configFileProvider([configFile(fileId: 'env_for_backend', targetLocation: '.env')]) {
+                        // Move the .env file to the correct directory and set permissions
+                        sh '''
+                        mv .env ecommerce-backend/.env
+                        chmod 644 ecommerce-backend/.env        # Set permissions to rw-r--r--
+                        echo "Injected and moved .env file to ecommerce-backend/ directory"
+                        echo "Contents of ecommerce-backend directory:"
+                        ls -la ecommerce-backend/
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Sonarqube Analysis') {
+            steps {
+                dir('ecommerce-backend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh ''' $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=three-tier-backend \
+                        -Dsonar.projectKey=three-tier-backend '''
+                    }
+                }
+            }
+        }
+        stage('Quality Check') {
+            steps {
+                script {
+                    waitForQualityGate(timeout: '10', abortPipeline: false, credentialsId: 'sonar-token')
+                }
+            }
+        }
+        stage('Trivy File Scan') {
+            steps {
+                dir('ecommerce-backend') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    dir('ecommerce-backend') {
+                        sh "docker build -t ${DOCKER_IMAGE} ."
+                    }
+                }
+            }
+        }
+
+        stage('Authenticate AWS ECR') {
+            steps {
+                script {
+                    // Remove existing Docker config to avoid conflicts
+                    sh 'rm -rf /var/lib/jenkins/.docker/config.json'
+                    // Authenticate with ECR
+                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}"
+                }
+            }
+        }
+
+        stage('Tag and Push Docker Image to ECR') {
+            steps {
+                script {
+                    sh "docker tag ${DOCKER_IMAGE} ${ECR_URI}:${env.BUILD_NUMBER}"
+                    sh "docker push ${ECR_URI}:${env.BUILD_NUMBER}"
+                }
+            }
+        }
+        stage('Trivy Scan Image') {
+            steps {
+                sh "trivy image --format table -o trivy-image-report.html ${ECR_URI}:${env.BUILD_NUMBER}"
+            }
+        }
+
+        stage('Checkout Kubernetes Manifests') {  
+            steps {  
+                checkout([$class: 'GitSCM',   
+                    branches: [[name: '*/main']],   
+                    userRemoteConfigs: [[url: 'https://github.com/Madeep9347/ecommerce-three-tier-kubernets-manifest-files.git', credentialsId: 'git-cred']]  
+                ])  
+            }  
+        }
+
+        stage('Update Deployment File') {
+            environment {
+                GIT_REPO_NAME = "ecommerce-three-tier-kubernets-manifest-files"  
+                GIT_USER_NAME = "Madeep9347"                                 
+            }
+            steps {
+                dir('') {
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                            git config user.email "madeep9347@gmail.com"         # Use your email 
+                            git config user.name "${GIT_USER_NAME}"               # Use your GitHub username
+                            BUILD_NUMBER=${BUILD_NUMBER}
+                            echo $BUILD_NUMBER
+                            imageTag=$(grep -oP '(?<=backend:)[^ ]+' backend-deployment-service.yaml )
+                            echo $imageTag
+                            sed -i "s/${AWS_ECR_REPO_NAME}:${imageTag}/${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}/" backend-deployment-service.yaml
+                            git add backend-deployment-service.yaml
+                            git commit -m "Update deployment image to version ${BUILD_NUMBER}"
+                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                withKubeConfig(
+                    caCertificate: '', 
+                    clusterName: 'three-tier', 
+                    contextName: '', 
+                    credentialsId: 'k8-token', 
+                    namespace: 'webapps', 
+                    restrictKubeConfigAccess: false, 
+                    serverUrl: 'https://96DCA0B255385E8A65FF588DE9D6E8AA.gr7.us-east-2.eks.amazonaws.com'
+                ) {
+                    sh "kubectl apply -f backend-secret.yaml"
+                    sh "kubectl apply -f backend-deployment-service.yaml"
+                    sh 'kubectl get pods'
+                    sh 'kubectl get svc'
+                }
+            }
+        }
+        stage('Cleanup Old ECR Images') {
+            steps {
+                script {
+                    // List image tags in the repository
+                    def imageTags = sh(script: '''
+                        aws ecr list-images --region ${AWS_REGION} --repository-name ${ECR_REPO} --query "imageIds[*].imageTag" --output text
+                    ''', returnStdout: true).trim().split()
+
+                    // Echo the list of image tags
+                    echo "All image tags: ${imageTags.join(', ')}"
+
+                    // Convert tags to integers and sort them
+                    def sortedTags = imageTags.collect { it.toInteger() }.sort().reverse().collect { it.toString() }
+
+                    // Echo the sorted image tags
+                    echo "Sorted image tags: ${sortedTags.join(', ')}"
+
+                    // Keep the most recent 3 tags
+                    def recentTags = sortedTags.take(3)
+
+                    // Echo the recent tags
+                    echo "Keeping most recent tags: ${recentTags.join(', ')}"
+
+                    // Identify tags to delete (older than the most recent 3)
+                    def tagsToDelete = sortedTags - recentTags
+
+                    // Echo the tags to be deleted
+                    echo "Tags to delete: ${tagsToDelete.join(', ')}"
+
+                    // Delete older images
+                    tagsToDelete.each { imageTag ->
+                        sh script: """
+                            aws ecr batch-delete-image --region ${AWS_REGION} --repository-name ${ECR_REPO} --image-ids imageTag=${imageTag}
+                        """, returnStatus: true
+
+                        // Echo each deleted tag
+                        echo "Deleted image tag: ${imageTag}"
+                    }
+
+                    if (tagsToDelete) {
+                        echo "Deleted images: ${tagsToDelete.join(', ')}"
+                    } else {
+                        echo 'No images to delete.'
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                deleteDir()
+                sh 'docker system prune -af'
+
+                def jobName = env.JOB_NAME
+                def buildNumber = env.BUILD_NUMBER
+                def pipelineStatus = currentBuild.currentResult ?: 'UNKNOWN'
+                def bannerColor = pipelineStatus.toUpperCase() == 'SUCCESS' ? 'green' : 'red'
+                def body = """
+                <html>
+                <body>
+                <div style="border: 4px solid ${bannerColor}; padding: 10px;">
+                    <h2>${jobName} - Build ${buildNumber}</h2>
+                    <div style="background-color: ${bannerColor}; padding: 10px;">
+                        <h3 style="color: white;">Pipeline Status: ${pipelineStatus.toUpperCase()}</h3>
+                    </div>
+                    <p>Check the <a href="${env.BUILD_URL}">console output</a>.</p>
+                </div>
+                </body>
+                </html>
+                """
+                emailext (
+                    subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
+                    body: body,
+                    to: 'madeep9347@gmail.com',
+                    from: 'jenkins@example.com',
+                    replyTo: 'jenkins@example.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'trivy-image-report.html'
+                )
+            }
+        }
+    }
+}
