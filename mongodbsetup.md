@@ -112,8 +112,34 @@ db.products.insertMany([
 ]);
 ```
 
-### Conclusion
-MongoDB is now set up and your `ecommerce` database is ready to be used with the `products` and `carts` collections populated with sample data.
+### Step 12: Configure MongoDB to Bind to All Network Interfaces
+
+To allow connections to MongoDB from external IPs (e.g., from your Docker container or another machine), modify the `bindIp` setting in the MongoDB configuration.
+
+1. Open the MongoDB configuration file `/etc/mongod.conf` using a text editor like `nano`.
+
+```bash
+sudo nano /etc/mongod.conf
+```
+
+2. Look for the `bindIp` setting under the `net` section and change it to `0.0.0.0` to allow connections from any network interface.
+
+```yaml
+net:
+  bindIp: 0.0.0.0  # Bind to all network interfaces
+  port: 27017
+```
+
+3. Save and exit the editor (`Ctrl + O` to save, then `Ctrl + X` to exit).
+
+4. Restart MongoDB to apply the changes:
+
+```bash
+sudo systemctl restart mongod
+```
+
+## Conclusion
+MongoDB is now set up, configured to accept connections from any network interface, and your `ecommerce` database is ready to be used with the `products` and `carts` collections populated with sample data.
 
 If you encounter any issues, make sure that MongoDB is running by checking the service status:
 
